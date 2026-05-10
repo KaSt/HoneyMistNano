@@ -4,9 +4,12 @@
 #include "esp_log.h"
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
+#include "esp_timer.h"
 #include "cJSON.h"
 #include "nvs.h"
 #include "sdkconfig.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 static const char *TAG = "intel";
 
@@ -26,24 +29,163 @@ bool intel_ip_is_private(const char *ip) {
 }
 
 static char cached_pulse_id[64] = {0};
+static char cached_pulse_name[128] = {0};
+static SemaphoreHandle_t otx_mutex;
+static int64_t otx_create_backoff_until_us;
+#define OTX_CREATE_BACKOFF_US (5LL * 60LL * 1000000LL)
+#define OTX_COOLDOWN_ENTRIES 64
+
+#ifndef CONFIG_OTX_PULSE_ID
+#define CONFIG_OTX_PULSE_ID ""
+#endif
+
+#ifndef CONFIG_OTX_REPORT_COOLDOWN_SECONDS
+#define CONFIG_OTX_REPORT_COOLDOWN_SECONDS 900
+#endif
+
+typedef struct {
+    char ip[64];
+    int64_t last_report_us;
+} otx_cooldown_entry_t;
+
+static otx_cooldown_entry_t otx_cooldown[OTX_COOLDOWN_ENTRIES];
+
+static char* create_pulse(const attack_info_t *seed);
+
+static bool otx_cooldown_allow(const char *ip, int64_t now_us, int64_t *remaining_us) {
+    int empty_slot = -1;
+    int oldest_slot = 0;
+    int64_t oldest_seen_us = INT64_MAX;
+    int64_t cooldown_us = (int64_t)CONFIG_OTX_REPORT_COOLDOWN_SECONDS * 1000000LL;
+
+    if (remaining_us != NULL) {
+        *remaining_us = 0;
+    }
+
+    if (cooldown_us <= 0 || ip == NULL || ip[0] == '\0') {
+        return true;
+    }
+
+    for (int i = 0; i < OTX_COOLDOWN_ENTRIES; i++) {
+        if (otx_cooldown[i].ip[0] == '\0') {
+            if (empty_slot < 0) {
+                empty_slot = i;
+            }
+            continue;
+        }
+
+        if (strcmp(otx_cooldown[i].ip, ip) == 0) {
+            int64_t elapsed = now_us - otx_cooldown[i].last_report_us;
+            if (elapsed >= 0 && elapsed < cooldown_us) {
+                if (remaining_us != NULL) {
+                    *remaining_us = cooldown_us - elapsed;
+                }
+                return false;
+            }
+            return true;
+        }
+
+        if (otx_cooldown[i].last_report_us < oldest_seen_us) {
+            oldest_seen_us = otx_cooldown[i].last_report_us;
+            oldest_slot = i;
+        }
+    }
+
+    (void)empty_slot;
+    (void)oldest_slot;
+    return true;
+}
+
+static void otx_cooldown_commit(const char *ip, int64_t now_us) {
+    int empty_slot = -1;
+    int oldest_slot = 0;
+    int64_t oldest_seen_us = INT64_MAX;
+
+    if (ip == NULL || ip[0] == '\0' || CONFIG_OTX_REPORT_COOLDOWN_SECONDS <= 0) {
+        return;
+    }
+
+    for (int i = 0; i < OTX_COOLDOWN_ENTRIES; i++) {
+        if (otx_cooldown[i].ip[0] == '\0') {
+            if (empty_slot < 0) {
+                empty_slot = i;
+            }
+            continue;
+        }
+
+        if (strcmp(otx_cooldown[i].ip, ip) == 0) {
+            otx_cooldown[i].last_report_us = now_us;
+            return;
+        }
+
+        if (otx_cooldown[i].last_report_us < oldest_seen_us) {
+            oldest_seen_us = otx_cooldown[i].last_report_us;
+            oldest_slot = i;
+        }
+    }
+
+    int slot = empty_slot >= 0 ? empty_slot : oldest_slot;
+    snprintf(otx_cooldown[slot].ip, sizeof(otx_cooldown[slot].ip), "%s", ip);
+    otx_cooldown[slot].last_report_us = now_us;
+}
 
 static void load_pulse_id() {
     nvs_handle_t handle;
     if (nvs_open("otx_cache", NVS_READONLY, &handle) == ESP_OK) {
         size_t size = sizeof(cached_pulse_id);
         nvs_get_str(handle, "pulse_id", cached_pulse_id, &size);
+        size = sizeof(cached_pulse_name);
+        nvs_get_str(handle, "pulse_name", cached_pulse_name, &size);
         nvs_close(handle);
     }
 }
 
-static void save_pulse_id(const char *id) {
+static void save_pulse_id(const char *id, const char *name) {
     nvs_handle_t handle;
     if (nvs_open("otx_cache", NVS_READWRITE, &handle) == ESP_OK) {
         nvs_set_str(handle, "pulse_id", id);
+        nvs_set_str(handle, "pulse_name", name != NULL ? name : "");
         nvs_commit(handle);
         nvs_close(handle);
     }
-    strncpy(cached_pulse_id, id, sizeof(cached_pulse_id) - 1);
+
+    snprintf(cached_pulse_id, sizeof(cached_pulse_id), "%s", id != NULL ? id : "");
+    snprintf(cached_pulse_name, sizeof(cached_pulse_name), "%s", name != NULL ? name : "");
+}
+
+static const char *ensure_pulse_id(const attack_info_t *attack) {
+    int64_t now_us;
+    char *created_id;
+
+    if (CONFIG_OTX_PULSE_ID[0] != '\0') {
+        return CONFIG_OTX_PULSE_ID;
+    }
+
+    if (cached_pulse_id[0] == '\0') {
+        load_pulse_id();
+    }
+
+    if (cached_pulse_id[0] != '\0' &&
+        (cached_pulse_name[0] == '\0' || strcmp(cached_pulse_name, CONFIG_OTX_PULSE_NAME) == 0)) {
+        return cached_pulse_id;
+    }
+
+    now_us = esp_timer_get_time();
+    if (now_us < otx_create_backoff_until_us) {
+        ESP_LOGW(TAG, "Skipping OTX pulse creation during backoff (%llds remaining)",
+                 (long long)((otx_create_backoff_until_us - now_us + 999999LL) / 1000000LL));
+        return NULL;
+    }
+
+    created_id = create_pulse(attack);
+    if (created_id == NULL) {
+        otx_create_backoff_until_us = now_us + OTX_CREATE_BACKOFF_US;
+        return NULL;
+    }
+
+    save_pulse_id(created_id, CONFIG_OTX_PULSE_NAME);
+    free(created_id);
+    return cached_pulse_id;
 }
 
 static char* create_pulse(const attack_info_t *seed) {
@@ -118,23 +260,35 @@ void intel_report_otx(const attack_info_t *attack) {
 #ifndef CONFIG_OTX_ENABLED
     return;
 #else
+    const char *pulse_id;
+    int64_t now_us;
+    int64_t cooldown_remaining_us = 0;
     if (!CONFIG_OTX_ENABLED || strlen(CONFIG_OTX_API_KEY) == 0) return;
     if (intel_ip_is_private(attack->ip)) return;
 
-    if (cached_pulse_id[0] == '\0') load_pulse_id();
+    if (otx_mutex == NULL) {
+        otx_mutex = xSemaphoreCreateMutex();
+    }
+    if (otx_mutex != NULL) {
+        xSemaphoreTake(otx_mutex, portMAX_DELAY);
+    }
 
-    char *pulse_id = NULL;
-    if (cached_pulse_id[0] == '\0') {
-        pulse_id = create_pulse(attack);
-        if (pulse_id) {
-            save_pulse_id(pulse_id);
-            free(pulse_id);
-            pulse_id = cached_pulse_id;
-        } else {
-            return;
+    now_us = esp_timer_get_time();
+    if (!otx_cooldown_allow(attack->ip, now_us, &cooldown_remaining_us)) {
+        ESP_LOGI(TAG, "Skipping OTX report for %s during cooldown (%llds remaining)",
+                 attack->ip, (long long)((cooldown_remaining_us + 999999LL) / 1000000LL));
+        if (otx_mutex != NULL) {
+            xSemaphoreGive(otx_mutex);
         }
-    } else {
-        pulse_id = cached_pulse_id;
+        return;
+    }
+
+    pulse_id = ensure_pulse_id(attack);
+    if (pulse_id == NULL || pulse_id[0] == '\0') {
+        if (otx_mutex != NULL) {
+            xSemaphoreGive(otx_mutex);
+        }
+        return;
     }
 
     char url[128];
@@ -147,7 +301,12 @@ void intel_report_otx(const attack_info_t *attack) {
         .timeout_ms = 10000,
     };
     esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (!client) return;
+    if (!client) {
+        if (otx_mutex != NULL) {
+            xSemaphoreGive(otx_mutex);
+        }
+        return;
+    }
 
     cJSON *root = cJSON_CreateObject();
     cJSON *indicators = cJSON_AddObjectToObject(root, "indicators");
@@ -176,10 +335,14 @@ void intel_report_otx(const attack_info_t *attack) {
     if (err == ESP_OK) {
         int status = esp_http_client_get_status_code(client);
         if (status >= 200 && status < 300) {
+            otx_cooldown_commit(attack->ip, now_us);
             ESP_LOGI(TAG, "Successfully reported %s to OTX pulse %s", attack->ip, pulse_id);
         } else if (status == 404) {
-            ESP_LOGW(TAG, "OTX pulse %s not found (404), clearing cache", pulse_id);
-            save_pulse_id("");
+            ESP_LOGW(TAG, "OTX pulse %s not found (404)%s", pulse_id,
+                     CONFIG_OTX_PULSE_ID[0] != '\0' ? "" : ", clearing cache");
+            if (CONFIG_OTX_PULSE_ID[0] == '\0') {
+                save_pulse_id("", "");
+            }
         } else {
             ESP_LOGE(TAG, "OTX report failed with status %d", status);
         }
@@ -189,5 +352,8 @@ void intel_report_otx(const attack_info_t *attack) {
 
     free(patch_data);
     esp_http_client_cleanup(client);
+    if (otx_mutex != NULL) {
+        xSemaphoreGive(otx_mutex);
+    }
 #endif
 }

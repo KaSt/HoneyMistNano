@@ -34,6 +34,7 @@ static const char *TAG = "telnet_honeypot";
 #define MAX_CAPTURE_FIELD_LEN 128
 #define MAX_HUB_URL_LEN 256
 #define MAX_RESPONSE_BODY_LEN 256
+#define MAX_COMMAND_SUMMARY_LEN 4000
 #define HONEYPOT_FIRMWARE_VERSION "1"
 #define IP_COOLDOWN_SECONDS CONFIG_IP_COOLDOWN_SECONDS
 #define IP_COOLDOWN_US ((int64_t)IP_COOLDOWN_SECONDS * 1000000LL)
@@ -86,9 +87,15 @@ typedef struct {
     char *commands[MAX_SESSION_COMMANDS];
 } telnet_session_t;
 
+typedef struct {
+    const char *profile;
+    uint8_t confidence;
+} attack_classification_t;
+
 static SemaphoreHandle_t s_sessions_mutex;
 static SemaphoreHandle_t s_report_mutex;
 static SemaphoreHandle_t s_ip_cooldown_mutex;
+static SemaphoreHandle_t s_network_report_mutex;
 static telnet_session_t *s_sessions[MAX_CONNECTIONS];
 static ip_cooldown_entry_t s_ip_cooldown[IP_COOLDOWN_ENTRIES];
 
@@ -132,10 +139,6 @@ static void free_session(telnet_session_t *session);
 static void handle_telnet_options(unsigned char *buf, int len, int sock);
 static bool ip_cooldown_allow(const char *ip, int64_t now_us, int64_t *remaining_us);
 
-static void send_raw(int sock, const char *str, int len) {
-    send(sock, str, len, 0);
-}
-
 static void send_str(int sock, const char *str) {
     size_t len = strlen(str);
     send(sock, str, len, 0);
@@ -168,14 +171,6 @@ static char* trim_whitespace(char *str) {
     return str;
 }
 
-static int is_printable(const char *str) {
-    while (*str) {
-        if (*str < 32 || *str > 126) return 0;
-        str++;
-    }
-    return 1;
-}
-
 static int build_path(char *dest, size_t dest_size, const char *base, const char *name) {
     int len;
 
@@ -206,6 +201,9 @@ static void ensure_runtime_state(void) {
     }
     if (s_ip_cooldown_mutex == NULL) {
         s_ip_cooldown_mutex = xSemaphoreCreateMutex();
+    }
+    if (s_network_report_mutex == NULL) {
+        s_network_report_mutex = xSemaphoreCreateMutex();
     }
 }
 
@@ -556,6 +554,210 @@ static uint32_t get_flash_size_mb(void) {
     return flash_size / (1024 * 1024);
 }
 
+static bool char_equal_ci(char a, char b) {
+    return tolower((unsigned char)a) == tolower((unsigned char)b);
+}
+
+static bool contains_ci(const char *haystack, const char *needle) {
+    size_t needle_len;
+
+    if (haystack == NULL || needle == NULL) {
+        return false;
+    }
+
+    needle_len = strlen(needle);
+    if (needle_len == 0) {
+        return true;
+    }
+
+    for (const char *p = haystack; *p != '\0'; p++) {
+        size_t i = 0;
+        while (i < needle_len && p[i] != '\0' && char_equal_ci(p[i], needle[i])) {
+            i++;
+        }
+        if (i == needle_len) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool commands_contain_any(const telnet_session_t *session,
+                                 const char *const *needles,
+                                 size_t needle_count) {
+    if (session == NULL || needles == NULL) {
+        return false;
+    }
+
+    for (size_t i = 0; i < session->command_count; i++) {
+        for (size_t j = 0; j < needle_count; j++) {
+            if (contains_ci(session->commands[i], needles[j])) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+static bool match_mirai_credentials(const char *user, const char *pass) {
+    static const struct {
+        const char *user;
+        const char *pass;
+    } pairs[] = {
+        {"root", "xc3511"}, {"root", "vizxv"}, {"root", "admin"},
+        {"admin", "admin"}, {"root", "888888"}, {"root", "xmhdipc"},
+        {"root", "default"}, {"root", "juantech"}, {"root", "123456"},
+        {"root", "54321"}, {"support", "support"}, {"root", ""},
+        {"admin", ""}, {"root", "root"}, {"root", "12345"},
+        {"user", "user"}, {"admin", "password"}, {"root", "pass"},
+        {"root", "klv123"}, {"root", "Zte521"}, {"root", "hi3518"},
+        {"root", "jvbzd"}, {"root", "anko"}, {"root", "zlxx."},
+        {"root", "system"}, {"root", "ikwb"}, {"root", "dreambox"},
+        {"root", "user"}, {"root", "realtek"}, {"root", "00000000"},
+        {"admin", "1111111"}, {"admin", "1234"}, {"admin", "12345"},
+        {"admin", "54321"}, {"admin", "123456"}, {"admin", "pass"},
+        {"admin", "meinsm"}, {"tech", "tech"}, {"ubnt", "ubnt"},
+        {"root", "666666"}, {"root", "password"}, {"root", "1234"},
+        {"guest", "guest"}, {"guest", "12345"}, {"administrator", "1234"},
+        {"666666", "666666"}, {"888888", "888888"},
+    };
+
+    for (size_t i = 0; i < sizeof(pairs) / sizeof(pairs[0]); i++) {
+        if (strcmp(user, pairs[i].user) == 0 && strcmp(pass, pairs[i].pass) == 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool ip_is_private_or_lan(const char *ip) {
+    int a = 0;
+    int b = 0;
+
+    if (ip == NULL || ip[0] == '\0') {
+        return true;
+    }
+
+    if (strcmp(ip, "::1") == 0 || strncmp(ip, "127.", 4) == 0 ||
+        strncmp(ip, "10.", 3) == 0 || strncmp(ip, "192.168.", 8) == 0 ||
+        strncmp(ip, "169.254.", 8) == 0) {
+        return true;
+    }
+
+    if (sscanf(ip, "%d.%d.", &a, &b) == 2) {
+        if (a == 172 && b >= 16 && b <= 31) {
+            return true;
+        }
+        if (a == 100 && b >= 64 && b <= 127) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static attack_classification_t classify_session(const telnet_session_t *session) {
+    static const char *const mirai_markers[] = {
+        "ECCHI", "MIRAI", "OWARI", "HOHO", "GAFGYT", "TSUNAMI", "LZRD",
+        "/bin/busybox echo", "/bin/busybox cat /bin/sh"
+    };
+    static const char *const fetch_markers[] = {
+        "wget ", "curl ", "tftp ", "ftpget "
+    };
+    static const char *const chmod_markers[] = {
+        "chmod 777", "chmod +x", "chmod 755"
+    };
+    static const char *const exec_markers[] = {
+        "/tmp/", "/var/run/", "./.x", "./loligang", "./"
+    };
+    static const char *const recon_markers[] = {
+        "uname -a", "/proc/cpuinfo", "free", "df", "ifconfig", "netstat"
+    };
+    static const char *const manual_markers[] = {
+        "history", "sudo ", "vi ", "vim ", "nano ", "clear"
+    };
+    bool mirai_creds = match_mirai_credentials(session->username, session->password);
+    bool fetch = commands_contain_any(session, fetch_markers, sizeof(fetch_markers) / sizeof(fetch_markers[0]));
+    bool chmod = commands_contain_any(session, chmod_markers, sizeof(chmod_markers) / sizeof(chmod_markers[0]));
+    bool exec = commands_contain_any(session, exec_markers, sizeof(exec_markers) / sizeof(exec_markers[0]));
+    bool recon = commands_contain_any(session, recon_markers, sizeof(recon_markers) / sizeof(recon_markers[0]));
+    bool manual = commands_contain_any(session, manual_markers, sizeof(manual_markers) / sizeof(manual_markers[0]));
+
+    if (commands_contain_any(session, mirai_markers, sizeof(mirai_markers) / sizeof(mirai_markers[0]))) {
+        return (attack_classification_t){ "mirai", 95 };
+    }
+
+    if (fetch && (chmod || exec)) {
+        return (attack_classification_t){ "iot-loader", 88 };
+    }
+
+    if (session->command_count == 0) {
+        if (mirai_creds) {
+            return (attack_classification_t){ "scanner", 75 };
+        }
+        return (attack_classification_t){ session->auth_attempts > 0 ? "creds-only" : "creds-probe", 60 };
+    }
+
+    if (mirai_creds && recon) {
+        return (attack_classification_t){ "scanner", 80 };
+    }
+
+    if (recon && session->command_count >= 3) {
+        return (attack_classification_t){ "recon-script", 75 };
+    }
+
+    if (manual) {
+        return (attack_classification_t){ "manual", 55 };
+    }
+
+    if (session->command_count >= 3) {
+        return (attack_classification_t){ "scripted", 70 };
+    }
+
+    if (mirai_creds) {
+        return (attack_classification_t){ "scanner", 65 };
+    }
+
+    if (ip_is_private_or_lan(session->source_ip)) {
+        return (attack_classification_t){ "lan", 30 };
+    }
+
+    return (attack_classification_t){ "scanner", 40 };
+}
+
+static char *build_command_summary(const telnet_session_t *session) {
+    char *summary;
+    size_t pos = 0;
+
+    summary = malloc(MAX_COMMAND_SUMMARY_LEN + 1);
+    if (summary == NULL) {
+        return NULL;
+    }
+
+    summary[0] = '\0';
+    for (size_t i = 0; i < session->command_count && pos < MAX_COMMAND_SUMMARY_LEN; i++) {
+        const char *cmd = session->commands[i];
+        size_t len = strlen(cmd);
+
+        if (i > 0) {
+            summary[pos++] = '\n';
+        }
+
+        if (pos + len > MAX_COMMAND_SUMMARY_LEN) {
+            len = MAX_COMMAND_SUMMARY_LEN - pos;
+        }
+
+        memcpy(summary + pos, cmd, len);
+        pos += len;
+    }
+
+    summary[pos] = '\0';
+    return summary;
+}
+
 static cJSON *build_attack_report_json(const telnet_session_t *session) {
     cJSON *root = cJSON_CreateObject();
     cJSON *honeypot;
@@ -563,9 +765,12 @@ static cJSON *build_attack_report_json(const telnet_session_t *session) {
     cJSON *attack;
     cJSON *source;
     cJSON *auth;
+    cJSON *classification;
     cJSON *session_obj;
     cJSON *events;
     cJSON *term;
+    attack_classification_t attack_classification;
+    char *command_summary = NULL;
     char device_id[32];
 
     if (root == NULL) {
@@ -603,6 +808,18 @@ static cJSON *build_attack_report_json(const telnet_session_t *session) {
     cJSON_AddStringToObject(auth, "pass", session->password);
     cJSON_AddBoolToObject(auth, "authenticated", session->authenticated);
     cJSON_AddNumberToObject(auth, "attempts", (double)session->auth_attempts);
+
+    attack_classification = classify_session(session);
+    command_summary = build_command_summary(session);
+    classification = cJSON_AddObjectToObject(attack, "classification");
+    if (classification != NULL) {
+        cJSON_AddStringToObject(classification, "profile", attack_classification.profile);
+        cJSON_AddNumberToObject(classification, "confidence", (double)attack_classification.confidence);
+        if (command_summary != NULL && command_summary[0] != '\0') {
+            cJSON_AddStringToObject(classification, "command_summary", command_summary);
+        }
+    }
+    free(command_summary);
 
     // Explicit command fields for hub dashboards. According to the protocol
     // (§3.4.3), session.commands MUST be an integer. The array of actual
@@ -814,42 +1031,95 @@ static void decode_hex_escapes(char *dest, const char *src, size_t dest_size) {
 // Command Response Generator
 // ============================================================
 
-static void handle_echo(char *args, int sock) {
-    char *flag_ne = NULL;
-    char *flag_e = NULL;
-    char *text = args;
-    
-    // Check for -n and -e flags
-    char *token = strtok(args, " ");
-    while (token) {
-        if (strcmp(token, "-n") == 0) flag_ne = "-n";
-        else if (strcmp(token, "-e") == 0) flag_e = "-e";
-        else if (strcmp(token, "-ne") == 0 || strcmp(token, "-en") == 0) {
-            flag_ne = "-n";
-            flag_e = "-e";
-        }
-        else if (*token != '-') text = token;
-        token = strtok(NULL, " ");
+static char *skip_shell_spaces(char *str) {
+    while (*str == ' ' || *str == '\t') {
+        str++;
     }
-    
+    return str;
+}
+
+static void strip_outer_quotes(char *str) {
+    size_t len = strlen(str);
+
+    if (len >= 2 && ((str[0] == '\'' && str[len - 1] == '\'') ||
+                     (str[0] == '"' && str[len - 1] == '"'))) {
+        memmove(str, str + 1, len - 2);
+        str[len - 2] = '\0';
+    }
+}
+
+static void split_command_word(char *line, char **command, char **args) {
+    char *space;
+
+    line = skip_shell_spaces(line);
+    *command = line;
+    space = line;
+
+    while (*space && *space != ' ' && *space != '\t') {
+        space++;
+    }
+
+    if (*space) {
+        *space++ = '\0';
+        *args = skip_shell_spaces(space);
+    } else {
+        *args = space;
+    }
+}
+
+static const char *shell_basename(const char *command) {
+    const char *base = strrchr(command, '/');
+
+    return base != NULL ? base + 1 : command;
+}
+
+static void handle_echo(char *args, int sock) {
+    bool flag_n = false;
+    bool flag_e = false;
+    char *text = args;
+
+    args = skip_shell_spaces(args);
+    while (*args == '-') {
+        char *end = args;
+        while (*end && *end != ' ' && *end != '\t') {
+            end++;
+        }
+
+        size_t len = (size_t)(end - args);
+        if (len == 2 && strncmp(args, "-n", len) == 0) {
+            flag_n = true;
+        } else if (len == 2 && strncmp(args, "-e", len) == 0) {
+            flag_e = true;
+        } else if (len == 3 && (strncmp(args, "-ne", len) == 0 || strncmp(args, "-en", len) == 0)) {
+            flag_n = true;
+            flag_e = true;
+        } else {
+            break;
+        }
+
+        args = skip_shell_spaces(end);
+    }
+
+    text = args;
+    strip_outer_quotes(text);
+
     if (*text == '\0') {
-        // No text argument
-        if (flag_ne) send_str(sock, "");
-        else send_str(sock, "\r\n");
+        if (!flag_n) {
+            send_str(sock, "\r\n");
+        }
         return;
     }
-    
-    // Handle hex escapes in text
+
     char decoded[CMD_BUFFER_SIZE];
     if (flag_e) {
         decode_hex_escapes(decoded, text, sizeof(decoded));
-        if (flag_ne) {
+        if (flag_n) {
             send_str(sock, decoded);
         } else {
             send_line(sock, decoded);
         }
     } else {
-        if (flag_ne) {
+        if (flag_n) {
             send_str(sock, text);
         } else {
             send_line(sock, text);
@@ -858,19 +1128,21 @@ static void handle_echo(char *args, int sock) {
 }
 
 static void handle_wget(char *args, int sock) {
+    char *url = skip_shell_spaces(args);
+
+    if (*url == '\0') {
+        send_line(sock, "BusyBox v1.20.2 (2015-04-01 10:23:44 CST) multi-call binary.");
+        send_line(sock, "");
+        send_line(sock, "Usage: wget [-cq] [-O FILE] [--header 'HEADER: VALUE'] URL");
+        return;
+    }
+
     // Simulate wget output - looks like it's working
-    send_line(sock, "Connecting to [URL]...");
+    send_str(sock, "Connecting to ");
+    send_line(sock, url);
     vTaskDelay(50 / portTICK_PERIOD_MS);
     send_str(sock, "Connecting to ");
-    
-    // Extract URL if present
-    char *url = args;
-    while (*url == ' ') url++;
-    if (*url) {
-        send_str(sock, url);
-    } else {
-        send_str(sock, "[URL]");
-    }
+    send_str(sock, url);
     send_str(sock, " (");
     
     // Simulate progress
@@ -925,6 +1197,11 @@ static void handle_ls(char *args, int sock) {
     // Normalize path (remove trailing /)
     size_t len = strlen(path);
     while (len > 1 && path[len - 1] == '/') path[--len] = 0;
+
+    if (strcmp(path, "/") == 0) {
+        send_line(sock, "bin  dev  etc  mnt  proc  tmp  usr  var");
+        return;
+    }
     
     // Find matching entries
     int found = 0;
@@ -955,8 +1232,7 @@ static void handle_ls(char *args, int sock) {
                 int is_dir = 0;
                 for (int j = 0; filesystem[j] != NULL; j++) {
                     if (strncmp(filesystem[j], fs_path, strlen(fs_path)) == 0 &&
-                        (filesystem[j][strlen(fs_path)] == 0 ||
-                         filesystem[j][strlen(fs_path)] == '/')) {
+                        filesystem[j][strlen(fs_path)] == '/') {
                         is_dir = 1;
                         break;
                     }
@@ -1120,23 +1396,44 @@ static void handle_help(int sock) {
 }
 
 static void handle_busybox(char *args, int sock) {
+    char *applet;
+    char *applet_args;
+
+    args = skip_shell_spaces(args);
     if (*args == 0) {
         send_line(sock, "BusyBox v1.20.2 (2015-04-01 10:23:44 CST) multi-call binary.");
         send_line(sock, "Usage: busybox [function] [arguments]...");
         send_line(sock, "   or: busybox --list");
         return;
     }
-    
-    char cmd[64];
-    strncpy(cmd, args, sizeof(cmd) - 1);
-    cmd[sizeof(cmd) - 1] = 0;
-    
-    if (strncmp(cmd, "wget", 4) == 0) {
-        handle_wget(cmd + 4, sock);
-    } else if (strncmp(cmd, "echo", 4) == 0) {
-        handle_echo(cmd + 4, sock);
-    } else if (strncmp(cmd, "curl", 4) == 0) {
-        handle_curl(cmd + 4, sock);
+
+    if (strcmp(args, "--list") == 0) {
+        send_line(sock, "ash");
+        send_line(sock, "cat");
+        send_line(sock, "chmod");
+        send_line(sock, "cp");
+        send_line(sock, "df");
+        send_line(sock, "echo");
+        send_line(sock, "ls");
+        send_line(sock, "ps");
+        send_line(sock, "pwd");
+        send_line(sock, "rm");
+        send_line(sock, "sh");
+        send_line(sock, "uname");
+        send_line(sock, "wget");
+        return;
+    }
+
+    split_command_word(args, &applet, &applet_args);
+
+    if (strcmp(applet, "wget") == 0) {
+        handle_wget(applet_args, sock);
+    } else if (strcmp(applet, "echo") == 0) {
+        handle_echo(applet_args, sock);
+    } else if (strcmp(applet, "curl") == 0) {
+        handle_curl(applet_args, sock);
+    } else if (strcmp(applet, "sh") == 0 || strcmp(applet, "ash") == 0) {
+        return;
     } else {
         send_line(sock, "BusyBox v1.20.2 (2015-04-01 10:23:44 CST) multi-call binary.");
     }
@@ -1169,187 +1466,85 @@ static void handle_unknown(const char *cmd, int sock) {
 }
 
 // ============================================================
-// Attack Pattern Handlers
-// ============================================================
-
-static int is_attack_pattern(const char *cmd) {
-    // Check for the specific patterns mentioned
-    if (strstr(cmd, "LJUZBS") || strstr(cmd, "\\x4c\\x4a\\x55\\x5a\\x42\\x53")) return 1;
-    if (strstr(cmd, "DKAHGSPD") || strstr(cmd, "\\x44\\x4b\\x41\\x48\\x47\\x53\\x50\\x44")) return 1;
-    if (strstr(cmd, "wget http://") || strstr(cmd, "curl -O http://")) return 1;
-    if (strstr(cmd, ">/") || strstr(cmd, "> /")) return 1;
-    if (strstr(cmd, ".x&&") || strstr(cmd, "/.x")) return 1;
-    return 0;
-}
-
-static void handle_attack_command(char *cmd, telnet_session_t *session, int sock) {
-    log_command(cmd);
-    
-    // Pattern 1: /bin/busybox wget;/bin/busybox echo -ne '\x4c\x4a\x55\x5a\x42\x53'
-    if (strstr(cmd, "echo -ne") || strstr(cmd, "echo -e")) {
-        char *echo_pos = strstr(cmd, "echo");
-        if (echo_pos) {
-            char *args = echo_pos + 4;
-            while (*args == ' ') args++;
-            handle_echo(args, sock);
-        }
-        return;
-    }
-    
-    // Pattern for file creation attempts
-    if (strstr(cmd, ">/") || strstr(cmd, "&>/")) {
-        // Simulate file creation in various directories
-        char *slash = strchr(cmd, '/');
-        if (slash) {
-            // Extract directory
-            char dir[32];
-            int i = 0;
-            while (*slash && *slash != ' ' && *slash != ';' && i < sizeof(dir) - 1) {
-                dir[i++] = *slash++;
-            }
-            dir[i] = 0;
-            
-            // Check if it's one of our simulated directories
-            for (int j = 0; filesystem[j] != NULL; j++) {
-                if (strncmp(filesystem[j], dir, strlen(dir)) == 0) {
-                    // Simulate success but don't actually create file
-                    // Just don't output anything (redirect to file)
-                    return;
-                }
-            }
-        }
-        send_line(sock, "sh: can't create : Read-only file system");
-        return;
-    }
-    
-    // Pattern for chmod
-    if (strstr(cmd, "chmod")) {
-        char *chmod_pos = strstr(cmd, "chmod");
-        char *perms = chmod_pos + 5;
-        while (*perms == ' ') perms++;
-        char *filename = perms;
-        while (*filename && *filename != ' ') filename++;
-        while (*filename == ' ') filename++;
-        
-        if (*filename == 0) {
-            send_line(sock, "chmod: missing operand");
-        } else {
-            // Simulate success
-            // Don't output anything
-        }
-        return;
-    }
-    
-    // Pattern for rm
-    if (strstr(cmd, "rm -rf") || strstr(cmd, "rm -f")) {
-        // Simulate success
-        return;
-    }
-    
-    // Pattern for cp
-    if (strstr(cmd, "cp ")) {
-        // Simulate success
-        return;
-    }
-    
-    // Pattern for ./i or ./script execution
-    if (strstr(cmd, "./i") || strstr(cmd, "./")) {
-        send_line(sock, "sh: ./i: not found");
-        return;
-    }
-    
-    // Default: process as normal command
-    char *token = strtok(cmd, " ;&|");
-    while (token != NULL) {
-        char *trimmed = trim_whitespace(token);
-        if (*trimmed) {
-            session->authenticated = true;
-            // Re-process each command
-            char *first_space = strchr(trimmed, ' ');
-            char command[64];
-            if (first_space) {
-                strncpy(command, trimmed, first_space - trimmed);
-                command[first_space - trimmed] = 0;
-                char *cmd_args = first_space + 1;
-                while (*cmd_args == ' ') cmd_args++;
-                session->auth_attempts = session->auth_attempts == 0 ? 1 : session->auth_attempts;
-                
-                if (strcmp(command, "echo") == 0) handle_echo(cmd_args, sock);
-                else if (strcmp(command, "wget") == 0) handle_wget(cmd_args, sock);
-                else if (strcmp(command, "curl") == 0) handle_curl(cmd_args, sock);
-                else if (strcmp(command, "ls") == 0) handle_ls(cmd_args, sock);
-                else if (strcmp(command, "cd") == 0) handle_cd(cmd_args, sock);
-                else if (strcmp(command, "cat") == 0) handle_cat(cmd_args, sock);
-                else if (strcmp(command, "uname") == 0) handle_uname(cmd_args, sock);
-                else if (strcmp(command, "busybox") == 0) handle_busybox(cmd_args, sock);
-                else handle_unknown(command, sock);
-            } else {
-                if (strcmp(trimmed, "pwd") == 0) handle_pwd(sock);
-                else if (strcmp(trimmed, "id") == 0) handle_id(sock, "");
-                else if (strcmp(trimmed, "whoami") == 0) handle_whoami(sock);
-                else if (strcmp(trimmed, "hostname") == 0) handle_hostname(sock, "");
-                else if (strcmp(trimmed, "ps") == 0) handle_ps(sock);
-                else if (strcmp(trimmed, "free") == 0) handle_free(sock);
-                else if (strcmp(trimmed, "df") == 0) handle_df(sock, "");
-                else if (strcmp(trimmed, "help") == 0) handle_help(sock);
-                else handle_unknown(trimmed, sock);
-            }
-        }
-        token = strtok(NULL, " ;&|");
-    }
-}
-
-// ============================================================
 // Main Command Processor
 // ============================================================
 
-static void process_command(char *cmd, telnet_session_t *session, int sock) {
-    log_command(cmd);
-    session_record_command(session, cmd);
-    
-    if (is_attack_pattern(cmd)) {
-        handle_attack_command(cmd, session, sock);
+static bool is_redirection_only(const char *cmd) {
+    cmd = skip_shell_spaces((char *)cmd);
+
+    if (*cmd == '>') {
+        return true;
+    }
+
+    return cmd[0] == '2' && cmd[1] == '>';
+}
+
+static void handle_simple_command(char *line, telnet_session_t *session, int sock) {
+    char *command;
+    char *args;
+    const char *applet;
+
+    line = trim_whitespace(line);
+    if (*line == '\0' || is_redirection_only(line)) {
         return;
     }
-    
-    // Handle multi-command with ; & |
-    char *token = strtok(cmd, " ;&|");
-    while (token != NULL) {
-        char *trimmed = trim_whitespace(token);
-        if (*trimmed) {
-            session->authenticated = true;
-            char *first_space = strchr(trimmed, ' ');
-            char command[64];
-            
-            if (first_space) {
-                strncpy(command, trimmed, first_space - trimmed);
-                command[first_space - trimmed] = 0;
-                char *cmd_args = first_space + 1;
-                while (*cmd_args == ' ') cmd_args++;
-                session->auth_attempts = session->auth_attempts == 0 ? 1 : session->auth_attempts;
-                
-                if (strcmp(command, "echo") == 0) handle_echo(cmd_args, sock);
-                else if (strcmp(command, "wget") == 0) handle_wget(cmd_args, sock);
-                else if (strcmp(command, "curl") == 0) handle_curl(cmd_args, sock);
-                else if (strcmp(command, "ls") == 0) handle_ls(cmd_args, sock);
-                else if (strcmp(command, "cd") == 0) handle_cd(cmd_args, sock);
-                else if (strcmp(command, "cat") == 0) handle_cat(cmd_args, sock);
-                else if (strcmp(command, "uname") == 0) handle_uname(cmd_args, sock);
-                else if (strcmp(command, "id") == 0) handle_id(sock, cmd_args);
-                else if (strcmp(command, "busybox") == 0) handle_busybox(cmd_args, sock);
-                else if (strcmp(command, "df") == 0) handle_df(sock, cmd_args);
-                else handle_unknown(command, sock);
-            } else {
-                if (strcmp(trimmed, "pwd") == 0) handle_pwd(sock);
-                else if (strcmp(trimmed, "whoami") == 0) handle_whoami(sock);
-                else if (strcmp(trimmed, "hostname") == 0) handle_hostname(sock, "");
-                else if (strcmp(trimmed, "ps") == 0) handle_ps(sock);
-                else if (strcmp(trimmed, "free") == 0) handle_free(sock);
-                else if (strcmp(trimmed, "help") == 0) handle_help(sock);
-                else handle_unknown(trimmed, sock);
+
+    session->authenticated = true;
+    split_command_word(line, &command, &args);
+    applet = shell_basename(command);
+
+    if (strcmp(applet, "busybox") == 0) handle_busybox(args, sock);
+    else if (strcmp(applet, "echo") == 0) handle_echo(args, sock);
+    else if (strcmp(applet, "wget") == 0) handle_wget(args, sock);
+    else if (strcmp(applet, "curl") == 0) handle_curl(args, sock);
+    else if (strcmp(applet, "ls") == 0) handle_ls(args, sock);
+    else if (strcmp(applet, "cd") == 0) handle_cd(args, sock);
+    else if (strcmp(applet, "cat") == 0) handle_cat(args, sock);
+    else if (strcmp(applet, "uname") == 0) handle_uname(args, sock);
+    else if (strcmp(applet, "id") == 0) handle_id(sock, args);
+    else if (strcmp(applet, "df") == 0) handle_df(sock, args);
+    else if (strcmp(applet, "pwd") == 0) handle_pwd(sock);
+    else if (strcmp(applet, "whoami") == 0) handle_whoami(sock);
+    else if (strcmp(applet, "hostname") == 0) handle_hostname(sock, args);
+    else if (strcmp(applet, "ps") == 0) handle_ps(sock);
+    else if (strcmp(applet, "free") == 0) handle_free(sock);
+    else if (strcmp(applet, "help") == 0) handle_help(sock);
+    else if (strcmp(applet, "sh") == 0 || strcmp(applet, "ash") == 0) return;
+    else if (strcmp(applet, "chmod") == 0 || strcmp(applet, "cp") == 0 ||
+             strcmp(applet, "rm") == 0 || strcmp(applet, "touch") == 0 ||
+             strcmp(applet, "mkdir") == 0) return;
+    else handle_unknown(command, sock);
+}
+
+static void process_command(char *cmd, telnet_session_t *session, int sock) {
+    char *segment = cmd;
+    char quote = '\0';
+
+    log_command(cmd);
+    session_record_command(session, cmd);
+
+    for (char *p = cmd; ; p++) {
+        if (*p == '\'' || *p == '"') {
+            if (quote == '\0') {
+                quote = *p;
+            } else if (quote == *p) {
+                quote = '\0';
             }
         }
-        token = strtok(NULL, " ;&|");
+
+        if (*p == '\0' || (quote == '\0' && (*p == ';' || *p == '|' || *p == '&'))) {
+            char separator = *p;
+            *p = '\0';
+            handle_simple_command(segment, session, sock);
+
+            if (separator == '\0') {
+                break;
+            }
+            if ((separator == '&' || separator == '|') && p[1] == separator) {
+                p++;
+            }
+            segment = p + 1;
+        }
     }
 }
 
@@ -1497,9 +1692,6 @@ cleanup:
     session->duration_ms = (uint32_t)((esp_timer_get_time() - session->started_us) / 1000ULL);
     close(client_sock);
     session_unregister(session);
-    if (hub_reporting_enabled()) {
-        submit_attack_report(session);
-    }
 
     attack_info_t info = {0};
     strncpy(info.ip, session->source_ip, sizeof(info.ip) - 1);
@@ -1507,7 +1699,21 @@ cleanup:
     strncpy(info.user, session->username, sizeof(info.user) - 1);
     strncpy(info.protocol, "telnet", sizeof(info.protocol) - 1);
     info.authenticated = session->authenticated;
-    intel_report_otx(&info);
+
+    ensure_runtime_state();
+    if (s_network_report_mutex == NULL ||
+        xSemaphoreTake(s_network_report_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        if (hub_reporting_enabled()) {
+            submit_attack_report(session);
+        }
+        intel_report_otx(&info);
+        if (s_network_report_mutex != NULL) {
+            xSemaphoreGive(s_network_report_mutex);
+        }
+    } else {
+        ESP_LOGW(TAG, "Skipping network reports for %s:%d because reporter is busy",
+                 session->source_ip, session->source_port);
+    }
 
     free_session(session);
     vTaskDelete(NULL);

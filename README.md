@@ -17,6 +17,7 @@ HoneyMistNano simulates a **generic embedded IoT appliance** environment, specif
   - **OLED Support:** Custom driver optimized for the **72x40 SSD1306** (EastRising style) with correct column offsets.
   - **Boot Logo:** Stylish startup splash screen.
   - **Attack Icons:** Displays a CRT terminal icon when an attacker connects.
+  - **Attack LED:** Blinks a configurable GPIO LED on attacker connection; defaults to GPIO 8 active-low for common ESP32-C3 SuperMini boards.
   - **Power Save:** Automatically dims the screen after 30 seconds of inactivity.
 - **Forensic Capture:**
   - Full input/output transcripts.
@@ -34,6 +35,7 @@ HoneyMistNano simulates a **generic embedded IoT appliance** environment, specif
   - **SCL:** GPIO 6
   - **Driver Note:** Includes hardcoded column offsets for proper 72x40 centering.
 - **Optional Button:** GPIO 9 for waking the screen.
+- **Optional/Onboard LED:** GPIO 8 active-low by default, configurable in menuconfig.
 
 ## 🚀 Getting Started
 
@@ -42,7 +44,7 @@ HoneyMistNano simulates a **generic embedded IoT appliance** environment, specif
    - **WiFi:** SSID and Password.
    - **Hub:** URL and Bearer Token.
    - **Cooldown:** Set the IP throttling window (default 180s).
-   - **OTX:** Enable reporting and set your AlienVault API Key.
+   - **OTX:** Enable reporting, set your AlienVault API key, optionally set an existing Pulse ID, and tune the per-IP report cooldown. If no Pulse ID is configured, the first report creates one and caches it in NVS.
 
 2. **Build & Flash:**
    ```bash

@@ -30,6 +30,40 @@ config IP_COOLDOWN_SECONDS
     help
         Time to wait before allowing a new connection from the same IP (prevents flooding).
 
+config ATTACK_LED_ENABLED
+    bool "Blink status LED on attack"
+    default y
+    help
+        Blink a GPIO-driven board LED when a new attacker connects.
+
+config ATTACK_LED_GPIO
+    int "Attack LED GPIO"
+    default 8
+    depends on ATTACK_LED_ENABLED
+    help
+        GPIO connected to the board LED. Many ESP32-C3 SuperMini boards use GPIO 8.
+
+config ATTACK_LED_ACTIVE_LOW
+    bool "Attack LED is active-low"
+    default y
+    depends on ATTACK_LED_ENABLED
+    help
+        Enable when the LED turns on by driving the GPIO low.
+
+config ATTACK_LED_BLINK_MS
+    int "Attack LED blink duration (ms)"
+    default 2500
+    depends on ATTACK_LED_ENABLED
+    help
+        Total duration of the LED blink pattern after an attack is detected.
+
+config ATTACK_LED_INTERVAL_MS
+    int "Attack LED blink interval (ms)"
+    default 120
+    depends on ATTACK_LED_ENABLED
+    help
+        Time between LED toggles during the attack blink pattern.
+
 config OTX_ENABLED
     bool "Enable AlienVault OTX reporting"
     default n
@@ -43,11 +77,25 @@ config OTX_API_KEY
     help
         Your AlienVault OTX API key.
 
+config OTX_PULSE_ID
+    string "Existing OTX Pulse ID"
+    default ""
+    depends on OTX_ENABLED
+    help
+        Optional existing OTX pulse id. If set, indicators are appended to this pulse and no pulse is created.
+
 config OTX_PULSE_NAME
     string "OTX Pulse Name"
     default "HoneyMistNano Captures"
     depends on OTX_ENABLED
     help
-        Name for the OTX pulse where indicators will be added.
+        Name for the auto-created OTX pulse when no existing pulse id is configured.
+
+config OTX_REPORT_COOLDOWN_SECONDS
+    int "OTX per-IP report cooldown (seconds)"
+    default 900
+    depends on OTX_ENABLED
+    help
+        Minimum time before reporting the same attacker IP to OTX again.
 
 endmenu
