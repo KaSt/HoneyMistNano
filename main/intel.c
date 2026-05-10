@@ -256,15 +256,16 @@ static char* create_pulse(const attack_info_t *seed) {
     return new_id;
 }
 
-void intel_report_otx(const attack_info_t *attack) {
+bool intel_report_otx(const attack_info_t *attack) {
 #ifndef CONFIG_OTX_ENABLED
-    return;
+    return false;
 #else
     const char *pulse_id;
     int64_t now_us;
     int64_t cooldown_remaining_us = 0;
-    if (!CONFIG_OTX_ENABLED || strlen(CONFIG_OTX_API_KEY) == 0) return;
-    if (intel_ip_is_private(attack->ip)) return;
+    bool reported = false;
+    if (!CONFIG_OTX_ENABLED || strlen(CONFIG_OTX_API_KEY) == 0) return false;
+    if (intel_ip_is_private(attack->ip)) return false;
 
     if (otx_mutex == NULL) {
         otx_mutex = xSemaphoreCreateMutex();
@@ -280,7 +281,7 @@ void intel_report_otx(const attack_info_t *attack) {
         if (otx_mutex != NULL) {
             xSemaphoreGive(otx_mutex);
         }
-        return;
+        return false;
     }
 
     pulse_id = ensure_pulse_id(attack);
@@ -288,7 +289,7 @@ void intel_report_otx(const attack_info_t *attack) {
         if (otx_mutex != NULL) {
             xSemaphoreGive(otx_mutex);
         }
-        return;
+        return false;
     }
 
     char url[128];
@@ -305,7 +306,7 @@ void intel_report_otx(const attack_info_t *attack) {
         if (otx_mutex != NULL) {
             xSemaphoreGive(otx_mutex);
         }
-        return;
+        return false;
     }
 
     cJSON *root = cJSON_CreateObject();
@@ -336,6 +337,7 @@ void intel_report_otx(const attack_info_t *attack) {
         int status = esp_http_client_get_status_code(client);
         if (status >= 200 && status < 300) {
             otx_cooldown_commit(attack->ip, now_us);
+            reported = true;
             ESP_LOGI(TAG, "Successfully reported %s to OTX pulse %s", attack->ip, pulse_id);
         } else if (status == 404) {
             ESP_LOGW(TAG, "OTX pulse %s not found (404)%s", pulse_id,
@@ -355,5 +357,6 @@ void intel_report_otx(const attack_info_t *attack) {
     if (otx_mutex != NULL) {
         xSemaphoreGive(otx_mutex);
     }
+    return reported;
 #endif
 }

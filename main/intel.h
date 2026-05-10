@@ -1,5 +1,5 @@
 #ifndef INTEL_H
-#define IEL_H
+#define INTEL_H
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -12,7 +12,7 @@ typedef struct {
     bool authenticated;
 } attack_info_t;
 
-void intel_report_otx(const attack_info_t *attack);
+bool intel_report_otx(const attack_info_t *attack);
 bool intel_ip_is_private(const char *ip);
 
 #endif

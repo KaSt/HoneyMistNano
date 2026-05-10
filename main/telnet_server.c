@@ -92,6 +92,8 @@ typedef struct {
     uint8_t confidence;
 } attack_classification_t;
 
+#define REPORTED_TO_OTX (1U << 0)
+
 static SemaphoreHandle_t s_sessions_mutex;
 static SemaphoreHandle_t s_report_mutex;
 static SemaphoreHandle_t s_ip_cooldown_mutex;
@@ -134,7 +136,7 @@ static const char *filesystem[] = {
 static void session_record_event(telnet_session_t *session, char kind, const char *data, size_t len);
 static void session_record_command(telnet_session_t *session, const char *cmd);
 static telnet_session_t *session_find_by_sock(int sock);
-static esp_err_t submit_attack_report(telnet_session_t *session);
+static esp_err_t submit_attack_report(telnet_session_t *session, uint32_t reported_to_flags);
 static void free_session(telnet_session_t *session);
 static void handle_telnet_options(unsigned char *buf, int len, int sock);
 static bool ip_cooldown_allow(const char *ip, int64_t now_us, int64_t *remaining_us);
@@ -758,7 +760,7 @@ static char *build_command_summary(const telnet_session_t *session) {
     return summary;
 }
 
-static cJSON *build_attack_report_json(const telnet_session_t *session) {
+static cJSON *build_attack_report_json(const telnet_session_t *session, uint32_t reported_to_flags) {
     cJSON *root = cJSON_CreateObject();
     cJSON *honeypot;
     cJSON *hardware;
@@ -766,6 +768,7 @@ static cJSON *build_attack_report_json(const telnet_session_t *session) {
     cJSON *source;
     cJSON *auth;
     cJSON *classification;
+    cJSON *reported_to;
     cJSON *session_obj;
     cJSON *events;
     cJSON *term;
@@ -821,6 +824,13 @@ static cJSON *build_attack_report_json(const telnet_session_t *session) {
     }
     free(command_summary);
 
+    reported_to = cJSON_AddArrayToObject(attack, "reported_to");
+    if (reported_to != NULL) {
+        if ((reported_to_flags & REPORTED_TO_OTX) != 0) {
+            cJSON_AddItemToArray(reported_to, cJSON_CreateString("otx"));
+        }
+    }
+
     // Explicit command fields for hub dashboards. According to the protocol
     // (§3.4.3), session.commands MUST be an integer. The array of actual
     // command strings is moved to command_list to avoid clashing with the
@@ -860,7 +870,7 @@ static cJSON *build_attack_report_json(const telnet_session_t *session) {
     return root;
 }
 
-static esp_err_t submit_attack_report(telnet_session_t *session) {
+static esp_err_t submit_attack_report(telnet_session_t *session, uint32_t reported_to_flags) {
     esp_http_client_config_t config = {0};
     esp_http_client_handle_t client;
     cJSON *json;
@@ -882,7 +892,7 @@ static esp_err_t submit_attack_report(telnet_session_t *session) {
         }
     }
 
-    json = build_attack_report_json(session);
+    json = build_attack_report_json(session, reported_to_flags);
     if (json == NULL) {
         return ESP_ERR_NO_MEM;
     }
@@ -1699,14 +1709,17 @@ cleanup:
     strncpy(info.user, session->username, sizeof(info.user) - 1);
     strncpy(info.protocol, "telnet", sizeof(info.protocol) - 1);
     info.authenticated = session->authenticated;
+    uint32_t reported_to_flags = 0;
 
     ensure_runtime_state();
     if (s_network_report_mutex == NULL ||
         xSemaphoreTake(s_network_report_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        if (hub_reporting_enabled()) {
-            submit_attack_report(session);
+        if (intel_report_otx(&info)) {
+            reported_to_flags |= REPORTED_TO_OTX;
         }
-        intel_report_otx(&info);
+        if (hub_reporting_enabled()) {
+            submit_attack_report(session, reported_to_flags);
+        }
         if (s_network_report_mutex != NULL) {
             xSemaphoreGive(s_network_report_mutex);
         }
