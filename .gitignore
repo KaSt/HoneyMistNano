@@ -18,8 +18,8 @@ sdkconfig.defaults.local
 local.properties
 
 # symlinks
-HoneyOpus
-HoneyOpusHUB
+HoneyMire
+HoneyMireHUB
 
 # Binary artifacts (NVS partitions, etc.)
 *.bin

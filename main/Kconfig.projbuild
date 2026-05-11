@@ -13,16 +13,16 @@ config WIFI_PASSWORD
         WPA2 password used by the honeypot station interface.
 
 config HUB_URL
-    string "HoneyOpus hub URL"
+    string "HoneyMire hub URL"
     default ""
     help
-        Base hub origin, for example https://honeyopus.ka.st .
+        Base hub origin, for example https://honeymire.ka.st .
 
 config HUB_TOKEN
-    string "HoneyOpus hub token"
+    string "HoneyMire hub token"
     default ""
     help
-        Bearer token issued by the HoneyOpus hub for this honeypot.
+        Bearer token issued by the HoneyMire hub for this honeypot.
 
 config IP_COOLDOWN_SECONDS
     int "IP Cooldown (seconds)"

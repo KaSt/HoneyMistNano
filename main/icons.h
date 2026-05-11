@@ -3,7 +3,7 @@
 
 #include <stdint.h>
 
-// HoneyOpus icon assets. All bitmaps are XBM-style (LSB first), 1bpp.
+// HoneyMire icon assets. All bitmaps are XBM-style (LSB first), 1bpp.
 // Boot logo is sized to fit a 72x40 OLED. The Telnet attack icon is
 // a 32x32 square that gets centered on the display.
 

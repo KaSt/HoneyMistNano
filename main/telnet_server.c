@@ -25,8 +25,8 @@
 
 static const char *TAG = "telnet_honeypot";
 
-#define HONEYOPUS_SCHEMA "honeyopus.attack/v1"
-#define HONEYOPUS_PROTOCOL "telnet"
+#define HONEYMIRE_SCHEMA "honeymire.attack/v1"
+#define HONEYMIRE_PROTOCOL "telnet"
 #define MAX_SESSION_EVENTS 128
 #define MAX_SESSION_EVENT_BYTES (24 * 1024)
 #define MAX_SESSION_COMMANDS 64
@@ -782,7 +782,7 @@ static cJSON *build_attack_report_json(const telnet_session_t *session, uint32_t
 
     build_device_id(device_id, sizeof(device_id));
 
-    cJSON_AddStringToObject(root, "schema", HONEYOPUS_SCHEMA);
+    cJSON_AddStringToObject(root, "schema", HONEYMIRE_SCHEMA);
 
     honeypot = cJSON_AddObjectToObject(root, "honeypot");
     cJSON_AddStringToObject(honeypot, "device_id", device_id);
@@ -800,7 +800,7 @@ static cJSON *build_attack_report_json(const telnet_session_t *session, uint32_t
     cJSON_AddNumberToObject(attack, "id", (double)session->attack_id);
     cJSON_AddNumberToObject(attack, "ts", (double)session->started_ts);
     cJSON_AddNumberToObject(attack, "duration_ms", (double)session->duration_ms);
-    cJSON_AddStringToObject(attack, "protocol", HONEYOPUS_PROTOCOL);
+    cJSON_AddStringToObject(attack, "protocol", HONEYMIRE_PROTOCOL);
 
     source = cJSON_AddObjectToObject(attack, "source");
     cJSON_AddStringToObject(source, "ip", session->source_ip);
@@ -932,17 +932,17 @@ static esp_err_t submit_attack_report(telnet_session_t *session, uint32_t report
         response_body[len] = '\0';
 
         if (status == 200 || status == 201) {
-            ESP_LOGI(TAG, "Reported attack %" PRIu32 " to HoneyOpus hub (%d)", session->attack_id, status);
+            ESP_LOGI(TAG, "Reported attack %" PRIu32 " to HoneyMire hub (%d)", session->attack_id, status);
         } else if (status == 401) {
-            ESP_LOGW(TAG, "HoneyOpus hub rejected token for attack %" PRIu32, session->attack_id);
+            ESP_LOGW(TAG, "HoneyMire hub rejected token for attack %" PRIu32, session->attack_id);
             err = ESP_ERR_INVALID_RESPONSE;
         } else {
-            ESP_LOGW(TAG, "HoneyOpus hub returned %d for attack %" PRIu32 ": %s",
+            ESP_LOGW(TAG, "HoneyMire hub returned %d for attack %" PRIu32 ": %s",
                      status, session->attack_id, response_body);
             err = ESP_ERR_INVALID_RESPONSE;
         }
     } else {
-        ESP_LOGW(TAG, "HoneyOpus hub report failed for attack %" PRIu32 ": %s",
+        ESP_LOGW(TAG, "HoneyMire hub report failed for attack %" PRIu32 ": %s",
                  session->attack_id, esp_err_to_name(err));
     }
 
